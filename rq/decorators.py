@@ -64,4 +64,5 @@ class job(object):  # noqa
                                       ttl=self.ttl, depends_on=depends_on, at_front=at_front,
                                       meta=self.meta, description=self.description, failure_ttl=self.failure_ttl)
         f.delay = delay
+        f.__rqjob = self
         return f
