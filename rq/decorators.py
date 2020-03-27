@@ -2,6 +2,7 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+from copy import deepcopy
 from functools import wraps
 
 from rq.compat import string_types
@@ -42,6 +43,20 @@ class job(object):  # noqa
         self.failure_ttl = failure_ttl
 
     def __call__(self, f):
+        def jobspec():
+            return {
+                'queue': self.queue,
+                'queue_class': self.queue_class,
+                'timeout': self.timeout,
+                'result_ttl': self.result_ttl,
+                'ttl': self.ttl,
+                'meta': deepcopy(self.meta),
+                'depends_on': self.depends_on,
+                'at_front': self.at_front,
+                'description': self.description,
+                'failure_ttl': self.failure_ttl,
+            }
+
         @wraps(f)
         def delay(*args, **kwargs):
             if isinstance(self.queue, string_types):
@@ -65,4 +80,6 @@ class job(object):  # noqa
                                       meta=self.meta, description=self.description, failure_ttl=self.failure_ttl)
         f.delay = delay
         f.__rqjob = self
+        f.jobspec = jobspec
+
         return f
