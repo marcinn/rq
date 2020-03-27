@@ -687,7 +687,14 @@ class Worker(object):
             except HorseMonitorTimeoutException:
                 # Horse has not exited yet and is still running.
                 # Send a heartbeat to keep the worker alive.
-                self.heartbeat(self.job_monitoring_interval + 5)
+                if job.timeout != -1:
+                    heartbeat_timeout = job.timeout + 5
+                else:
+                    heartbeat_timeout = 90
+
+                self.heartbeat(
+                    self.job_monitoring_interval + heartbeat_timeout
+                )
 
                 # Kill the job from this side if something is really wrong (interpreter lock/etc).
                 if job.timeout != -1 and (utcnow() - job.started_at).total_seconds() > (job.timeout + 1):
