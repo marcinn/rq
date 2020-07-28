@@ -693,8 +693,7 @@ class Worker(object):
                     heartbeat_timeout = 90
 
                 self.heartbeat(
-                    # self.job_monitoring_interval + heartbeat_timeout
-                    self.job_monitoring_interval + 90
+                    self.job_monitoring_interval + heartbeat_timeout
                 )
 
                 # Kill the job from this side if something is really wrong (interpreter lock/etc).
