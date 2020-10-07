@@ -4,17 +4,18 @@ from __future__ import (absolute_import, division, print_function,
 
 import uuid
 import warnings
-
 from datetime import datetime
 
+from distutils.version import StrictVersion
 from redis import WatchError
 
 from .compat import as_text, string_types, total_ordering, utc
 from .connections import resolve_connection
 from .defaults import DEFAULT_RESULT_TTL
-from .exceptions import DequeueTimeout, NoSuchJobError, UnpickleError
+from .exceptions import DequeueTimeout, NoSuchJobError
 from .job import Job, JobStatus
-from .utils import backend_class, import_attribute, parse_timeout, utcnow
+from .serializers import resolve_serializer
+from .utils import backend_class, get_version, import_attribute, parse_timeout, utcnow
 
 
 def compact(lst):
@@ -29,7 +30,7 @@ class Queue(object):
     redis_queues_keys = 'rq:queues'
 
     @classmethod
-    def all(cls, connection=None, job_class=None):
+    def all(cls, connection=None, job_class=None, serializer=None):
         """Returns an iterable of all Queues.
         """
         connection = resolve_connection(connection)
@@ -37,13 +38,13 @@ class Queue(object):
         def to_queue(queue_key):
             return cls.from_queue_key(as_text(queue_key),
                                       connection=connection,
-                                      job_class=job_class)
+                                      job_class=job_class, serializer=serializer)
         return [to_queue(rq_key)
                 for rq_key in connection.smembers(cls.redis_queues_keys)
                 if rq_key]
 
     @classmethod
-    def from_queue_key(cls, queue_key, connection=None, job_class=None):
+    def from_queue_key(cls, queue_key, connection=None, job_class=None, serializer=None):
         """Returns a Queue instance, based on the naming conventions for naming
         the internal Redis keys.  Can be used to reverse-lookup Queues by their
         Redis keys.
@@ -52,10 +53,10 @@ class Queue(object):
         if not queue_key.startswith(prefix):
             raise ValueError('Not a valid RQ queue key: {0}'.format(queue_key))
         name = queue_key[len(prefix):]
-        return cls(name, connection=connection, job_class=job_class)
+        return cls(name, connection=connection, job_class=job_class, serializer=serializer)
 
     def __init__(self, name='default', default_timeout=None, connection=None,
-                 is_async=True, job_class=None, **kwargs):
+                 is_async=True, job_class=None, serializer=None, **kwargs):
         self.connection = resolve_connection(connection)
         prefix = self.redis_queue_namespace_prefix
         self.name = name
@@ -73,6 +74,9 @@ class Queue(object):
                 job_class = import_attribute(job_class)
             self.job_class = job_class
 
+        self.serializer = resolve_serializer(serializer)
+        self.redis_server_version = None
+
     def __len__(self):
         return self.count
 
@@ -84,6 +88,12 @@ class Queue(object):
 
     def __iter__(self):
         yield self
+
+    def get_redis_server_version(self):
+        """Return Redis server version of connection"""
+        if not self.redis_server_version:
+            self.redis_server_version = get_version(self.connection)
+        return self.redis_server_version
 
     @property
     def key(self):
@@ -151,6 +161,27 @@ class Queue(object):
             if job.origin == self.name:
                 return job
 
+    def get_job_position(self, job_or_id):
+        """Returns the position of a job within the queue
+
+        Using Redis before 6.0.6 and redis-py before 3.5.4 has a complexity of
+        worse than O(N) and should not be used for very long job queues. Redis
+        and redis-py version afterwards should support the LPOS command
+        handling job positions within Redis c implementation.
+        """
+        job_id = job_or_id.id if isinstance(job_or_id, self.job_class) else job_or_id
+
+        if self.get_redis_server_version() >= StrictVersion("6.0.6"):
+            try:
+                return self.connection.lpos(self.key, job_id)
+            except AttributeError:
+                # not yet implemented by redis-py
+                pass
+
+        if job_id in self.job_ids:
+            return self.job_ids.index(job_id)
+        return None
+
     def get_job_ids(self, offset=0, length=-1):
         """Returns a slice of job IDs in the queue."""
         start = offset
@@ -189,25 +220,25 @@ class Queue(object):
 
     @property
     def started_job_registry(self):
-        """Returns this queue's FailedJobRegistry."""
+        """Returns this queue's StartedJobRegistry."""
         from rq.registry import StartedJobRegistry
         return StartedJobRegistry(queue=self, job_class=self.job_class)
 
     @property
     def finished_job_registry(self):
-        """Returns this queue's FailedJobRegistry."""
+        """Returns this queue's FinishedJobRegistry."""
         from rq.registry import FinishedJobRegistry
         return FinishedJobRegistry(queue=self)
 
     @property
     def deferred_job_registry(self):
-        """Returns this queue's FailedJobRegistry."""
+        """Returns this queue's DeferredJobRegistry."""
         from rq.registry import DeferredJobRegistry
         return DeferredJobRegistry(queue=self, job_class=self.job_class)
 
     @property
     def scheduled_job_registry(self):
-        """Returns this queue's FailedJobRegistry."""
+        """Returns this queue's ScheduledJobRegistry."""
         from rq.registry import ScheduledJobRegistry
         return ScheduledJobRegistry(queue=self, job_class=self.job_class)
 
@@ -248,7 +279,7 @@ class Queue(object):
     def create_job(self, func, args=None, kwargs=None, timeout=None,
                    result_ttl=None, ttl=None, failure_ttl=None,
                    description=None, depends_on=None, job_id=None,
-                   meta=None, status=JobStatus.QUEUED):
+                   meta=None, status=JobStatus.QUEUED, retry=None):
         """Creates a job based on parameters given."""
         timeout = parse_timeout(timeout)
 
@@ -269,18 +300,22 @@ class Queue(object):
             result_ttl=result_ttl, ttl=ttl, failure_ttl=failure_ttl,
             status=status, description=description,
             depends_on=depends_on, timeout=timeout, id=job_id,
-            origin=self.name, meta=meta
+            origin=self.name, meta=meta, serializer=self.serializer
         )
+
+        if retry:
+            job.retries_left = retry.max
+            job.retry_intervals = retry.intervals
 
         return job
 
     def enqueue_call(self, func, args=None, kwargs=None, timeout=None,
                      result_ttl=None, ttl=None, failure_ttl=None,
                      description=None, depends_on=None, job_id=None,
-                     at_front=False, meta=None):
+                     at_front=False, meta=None, retry=None):
         """Creates a job to represent the delayed function call and enqueues
         it.
-
+nd
         It is much like `.enqueue()`, except that it takes the function's args
         and kwargs as explicit arguments.  Any kwargs passed to this function
         contain options for RQ itself.
@@ -290,6 +325,7 @@ class Queue(object):
             func, args=args, kwargs=kwargs, result_ttl=result_ttl, ttl=ttl,
             failure_ttl=failure_ttl, description=description, depends_on=depends_on,
             job_id=job_id, meta=meta, status=JobStatus.QUEUED, timeout=timeout,
+            retry=retry
         )
 
         # If a _dependent_ job depends on any unfinished job, register all the
@@ -363,6 +399,7 @@ class Queue(object):
         job_id = kwargs.pop('job_id', None)
         at_front = kwargs.pop('at_front', False)
         meta = kwargs.pop('meta', None)
+        retry = kwargs.pop('retry', None)
 
         if 'args' in kwargs or 'kwargs' in kwargs:
             assert args == (), 'Extra positional arguments cannot be used when using explicit args and kwargs'  # noqa
@@ -370,38 +407,46 @@ class Queue(object):
             kwargs = kwargs.pop('kwargs', None)
 
         return (f, timeout, description, result_ttl, ttl, failure_ttl,
-                depends_on, job_id, at_front, meta, args, kwargs)
+                depends_on, job_id, at_front, meta, retry, args, kwargs)
 
     def enqueue(self, f, *args, **kwargs):
         """Creates a job to represent the delayed function call and enqueues it."""
 
         (f, timeout, description, result_ttl, ttl, failure_ttl,
-         depends_on, job_id, at_front, meta, args, kwargs) = Queue.parse_args(f, *args, **kwargs)
-        
+         depends_on, job_id, at_front, meta, retry, args, kwargs) = Queue.parse_args(f, *args, **kwargs)
+
         return self.enqueue_call(
             func=f, args=args, kwargs=kwargs, timeout=timeout,
             result_ttl=result_ttl, ttl=ttl, failure_ttl=failure_ttl,
             description=description, depends_on=depends_on, job_id=job_id,
-            at_front=at_front, meta=meta
+            at_front=at_front, meta=meta, retry=retry
         )
 
     def enqueue_at(self, datetime, f, *args, **kwargs):
         """Schedules a job to be enqueued at specified time"""
-        from .registry import ScheduledJobRegistry
 
         (f, timeout, description, result_ttl, ttl, failure_ttl,
-         depends_on, job_id, at_front, meta, args, kwargs) = Queue.parse_args(f, *args, **kwargs)
+         depends_on, job_id, at_front, meta, retry, args, kwargs) = Queue.parse_args(f, *args, **kwargs)
         job = self.create_job(f, status=JobStatus.SCHEDULED, args=args, kwargs=kwargs,
                               timeout=timeout, result_ttl=result_ttl, ttl=ttl,
                               failure_ttl=failure_ttl, description=description,
-                              depends_on=depends_on, job_id=job_id, meta=meta)
+                              depends_on=depends_on, job_id=job_id, meta=meta, retry=retry)
 
+        return self.schedule_job(job, datetime)
+
+    def schedule_job(self, job, datetime, pipeline=None):
+        """Puts job on ScheduledJobRegistry"""
+        from .registry import ScheduledJobRegistry
         registry = ScheduledJobRegistry(queue=self)
-        with self.connection.pipeline() as pipeline:
-            job.save(pipeline=pipeline)
-            registry.schedule(job, datetime, pipeline=pipeline)
-            pipeline.execute()
 
+        pipe = pipeline if pipeline is not None else self.connection.pipeline()
+
+        # Add Queue key set
+        pipe.sadd(self.redis_queues_keys, self.key)
+        job.save(pipeline=pipe)
+        registry.schedule(job, datetime, pipeline=pipe)
+        if pipeline is None:
+            pipe.execute()
         return job
 
     def enqueue_in(self, time_delta, func, *args, **kwargs):
@@ -458,12 +503,23 @@ class Queue(object):
                 if pipeline is None:
                     pipe.watch(dependents_key)
 
-                dependent_jobs = [self.job_class.fetch(as_text(job_id), connection=self.connection)
-                                  for job_id in pipe.smembers(dependents_key)]
+                dependent_job_ids = [as_text(_id)
+                                     for _id in pipe.smembers(dependents_key)]
+
+                jobs_to_enqueue = [
+                    dependent_job for dependent_job
+                    in self.job_class.fetch_many(
+                        dependent_job_ids,
+                        connection=self.connection
+                    ) if dependent_job.dependencies_are_met(
+                        exclude_job_id=job.id,
+                        pipeline=pipe
+                    )
+                ]
 
                 pipe.multi()
 
-                for dependent in dependent_jobs:
+                for dependent in jobs_to_enqueue:
                     registry = DeferredJobRegistry(dependent.origin,
                                                    self.connection,
                                                    job_class=self.job_class)
@@ -552,7 +608,7 @@ class Queue(object):
                 # Silently pass on jobs that don't exist (anymore),
                 # and continue in the look
                 continue
-            except UnpickleError as e:
+            except Exception as e:
                 # Attach queue information on the exception for improved error
                 # reporting
                 e.job_id = job_id

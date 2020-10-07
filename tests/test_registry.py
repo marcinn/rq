@@ -152,6 +152,7 @@ class TestRegistry(RQTestCase):
         self.assertNotIn(job, self.registry)
         job.refresh()
         self.assertEqual(job.get_status(), JobStatus.FAILED)
+        self.assertTrue(job.exc_info)  # explanation is written to exc_info 
 
     def test_job_execution(self):
         """Job is removed from StartedJobRegistry after execution."""
@@ -355,6 +356,8 @@ class TestFailedJobRegistry(RQTestCase):
 
         job.refresh()
         self.assertEqual(job.get_status(), JobStatus.QUEUED)
+        self.assertEqual(job.started_at, None)
+        self.assertEqual(job.ended_at, None)
 
         worker.work(burst=True)
         self.assertTrue(job in registry)
@@ -408,7 +411,7 @@ class TestFailedJobRegistry(RQTestCase):
         timestamp = current_timestamp()
 
         job = q.enqueue(div_by_zero, failure_ttl=5)
-        w.handle_job_failure(job)
+        w.handle_job_failure(job, q)
         # job is added to FailedJobRegistry with default failure ttl
         self.assertIn(job.id, registry.get_job_ids())
         self.assertLess(self.testconn.zscore(registry.key, job.id),
@@ -416,6 +419,6 @@ class TestFailedJobRegistry(RQTestCase):
 
         # job is added to FailedJobRegistry with specified ttl
         job = q.enqueue(div_by_zero, failure_ttl=5)
-        w.handle_job_failure(job)
+        w.handle_job_failure(job, q)
         self.assertLess(self.testconn.zscore(registry.key, job.id),
                         timestamp + 7)

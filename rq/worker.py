@@ -12,7 +12,9 @@ import sys
 import time
 import traceback
 import warnings
-from datetime import timedelta
+
+from datetime import datetime, timedelta, timezone
+from distutils.version import StrictVersion
 from uuid import uuid4
 
 try:
@@ -37,10 +39,11 @@ from .registry import FailedJobRegistry, StartedJobRegistry, clean_registries
 from .scheduler import RQScheduler
 from .suspension import is_suspended
 from .timeouts import JobTimeoutException, HorseMonitorTimeoutException, UnixSignalDeathPenalty
-from .utils import (backend_class, ensure_list, enum,
+from .utils import (backend_class, ensure_list, enum, get_version,
                     make_colorizer, utcformat, utcnow, utcparse)
 from .version import VERSION
 from .worker_registration import clean_worker_registry, get_keys
+from .serializers import resolve_serializer
 
 try:
     from setproctitle import setproctitle as setprocname
@@ -104,7 +107,7 @@ class Worker(object):
     log_job_description = True
 
     @classmethod
-    def all(cls, connection=None, job_class=None, queue_class=None, queue=None):
+    def all(cls, connection=None, job_class=None, queue_class=None, queue=None, serializer=None):
         """Returns an iterable of all Workers.
         """
         if queue:
@@ -116,7 +119,7 @@ class Worker(object):
         workers = [cls.find_by_key(as_text(key),
                                    connection=connection,
                                    job_class=job_class,
-                                   queue_class=queue_class)
+                                   queue_class=queue_class, serializer=serializer)
                    for key in worker_keys]
         return compact(workers)
 
@@ -132,7 +135,7 @@ class Worker(object):
 
     @classmethod
     def find_by_key(cls, worker_key, connection=None, job_class=None,
-                    queue_class=None):
+                    queue_class=None, serializer=None):
         """Returns a Worker instance, based on the naming conventions for
         naming the internal Redis keys.  Can be used to reverse-lookup Workers
         by their Redis keys.
@@ -149,7 +152,7 @@ class Worker(object):
 
         name = worker_key[len(prefix):]
         worker = cls([], name, connection=connection, job_class=job_class,
-                     queue_class=queue_class, prepare_for_work=False)
+                     queue_class=queue_class, prepare_for_work=False, serializer=serializer)
 
         worker.refresh()
 
@@ -161,10 +164,12 @@ class Worker(object):
                  queue_class=None, log_job_description=True,
                  job_monitoring_interval=DEFAULT_JOB_MONITORING_INTERVAL,
                  disable_default_exception_handler=False,
-                 prepare_for_work=True):  # noqa
+                 prepare_for_work=True, serializer=None):  # noqa
         if connection is None:
             connection = get_current_connection()
         self.connection = connection
+
+        self.redis_server_version = None
 
         if prepare_for_work:
             self.hostname = socket.gethostname()
@@ -177,10 +182,11 @@ class Worker(object):
         self.queue_class = backend_class(self, 'queue_class', override=queue_class)
         self.version = VERSION
         self.python_version = sys.version
+        self.serializer = resolve_serializer(serializer)
 
         queues = [self.queue_class(name=q,
                                    connection=connection,
-                                   job_class=self.job_class)
+                                   job_class=self.job_class, serializer=self.serializer)
                   if isinstance(q, string_types) else q
                   for q in ensure_list(queues)]
 
@@ -208,11 +214,17 @@ class Worker(object):
 
         self.disable_default_exception_handler = disable_default_exception_handler
 
-        if isinstance(exception_handlers, list):
+        if isinstance(exception_handlers, (list, tuple)):
             for handler in exception_handlers:
                 self.push_exc_handler(handler)
         elif exception_handlers is not None:
             self.push_exc_handler(exception_handlers)
+
+    def get_redis_server_version(self):
+        """Return Redis server version of connection"""
+        if not self.redis_server_version:
+            self.redis_server_version = get_version(self.connection)
+        return self.redis_server_version
 
     def validate_queues(self):
         """Sanity check for the given queues."""
@@ -266,7 +278,8 @@ class Worker(object):
             now = utcnow()
             now_in_string = utcformat(now)
             self.birth_date = now
-            p.hmset(key, {
+
+            mapping={
                 'birth': now_in_string,
                 'last_heartbeat': now_in_string,
                 'queues': queues,
@@ -274,9 +287,15 @@ class Worker(object):
                 'hostname': self.hostname,
                 'version': self.version,
                 'python_version': self.python_version,
-            })
+            }
+
+            if self.get_redis_server_version() >= StrictVersion("4.0.0"):
+                p.hset(key, mapping=mapping)
+            else:
+                p.hmset(key, mapping)
+
             worker_registration.register(self, p)
-            p.expire(key, self.default_worker_ttl)
+            p.expire(key, self.default_worker_ttl + 60)
             p.execute()
 
     def register_death(self):
@@ -376,7 +395,6 @@ class Worker(object):
         """
         try:
             os.kill(self.horse_pid, sig)
-            os.waitpid(self.horse_pid, 0)
             self.log.info('Killed horse pid %s', self.horse_pid)
         except OSError as e:
             if e.errno == errno.ESRCH:
@@ -384,6 +402,19 @@ class Worker(object):
                 self.log.debug('Horse already dead')
             else:
                 raise
+
+    def wait_for_horse(self):
+        """
+        A waiting the end of the horse process and recycling resources.
+        """
+        pid = None
+        stat = None
+        try:
+            pid, stat = os.waitpid(self.horse_pid, 0)
+        except ChildProcessError as e:
+            # ChildProcessError: [Errno 10] No child processes
+            pass
+        return pid, stat
 
     def request_force_stop(self, signum, frame):
         """Terminates the application (cold shutdown).
@@ -394,6 +425,7 @@ class Worker(object):
         if self.horse_pid:
             self.log.debug('Taking down horse %s with me', self.horse_pid)
             self.kill_horse()
+            self.wait_for_horse()
         raise SystemExit()
 
     def request_stop(self, signum, frame):
@@ -471,7 +503,7 @@ class Worker(object):
 
         The return value indicates whether any jobs were processed.
         """
-        setup_loghandlers(logging_level, date_format, log_format)        
+        setup_loghandlers(logging_level, date_format, log_format)
         completed_jobs = 0
         self.register_birth()
         self.log.info("Worker %s: started, version %s", self.key, VERSION)
@@ -579,6 +611,7 @@ class Worker(object):
                 if result is not None:
 
                     job, queue = result
+                    job.redis_server_version = self.get_redis_server_version()
                     if self.log_job_description:
                         self.log.info(
                             '%s: %s (%s)', green(queue.name),
@@ -604,7 +637,7 @@ class Worker(object):
         If no timeout is given, the default_worker_ttl will be used to update
         the expiration time of the worker.
         """
-        timeout = timeout or self.default_worker_ttl
+        timeout = timeout or self.default_worker_ttl + 60
         connection = pipeline if pipeline is not None else self.connection
         connection.expire(self.key, timeout)
         connection.hset(self.key, 'last_heartbeat', utcformat(utcnow()))
@@ -644,7 +677,7 @@ class Worker(object):
         if queues:
             self.queues = [self.queue_class(queue,
                                             connection=self.connection,
-                                            job_class=self.job_class)
+                                            job_class=self.job_class, serializer=self.serializer)
                            for queue in queues.split(',')]
 
     def increment_failed_job_count(self, pipeline=None):
@@ -667,38 +700,46 @@ class Worker(object):
         os.environ['RQ_JOB_ID'] = job.id
         if child_pid == 0:
             self.main_work_horse(job, queue)
+            os._exit(0) # just in case
         else:
             self._horse_pid = child_pid
             self.procline('Forked {0} at {1}'.format(child_pid, time.time()))
 
-    def monitor_work_horse(self, job):
+    def monitor_work_horse(self, job, queue):
         """The worker will monitor the work horse and make sure that it
         either executes successfully or the status of the job is set to
         failed
         """
 
         ret_val = None
-        job.started_at = job.started_at or utcnow()
+        job.started_at = utcnow()
         while True:
             try:
                 with UnixSignalDeathPenalty(self.job_monitoring_interval, HorseMonitorTimeoutException):
-                    retpid, ret_val = os.waitpid(self._horse_pid, 0)
+                    retpid, ret_val = self.wait_for_horse()
                 break
             except HorseMonitorTimeoutException:
                 # Horse has not exited yet and is still running.
                 # Send a heartbeat to keep the worker alive.
-                if job.timeout != -1:
-                    heartbeat_timeout = job.timeout + 5
-                else:
-                    heartbeat_timeout = 90
 
-                self.heartbeat(
-                    self.job_monitoring_interval + heartbeat_timeout
-                )
+                # ----
+                # alternative version of calculating heartbeat timeout
+                # if job.timeout != -1:
+                #    heartbeat_timeout = job.timeout + 5
+                # else:
+                #    heartbeat_timeout = 90
+                #
+                # self.heartbeat(
+                #     self.job_monitoring_interval + heartbeat_timeout
+                # )
+                # ----
+
+                self.heartbeat(self.job_monitoring_interval + 60)
 
                 # Kill the job from this side if something is really wrong (interpreter lock/etc).
-                if job.timeout != -1 and (utcnow() - job.started_at).total_seconds() > (job.timeout + 1):
+                if job.timeout != -1 and (utcnow() - job.started_at).total_seconds() > (job.timeout + 60):
                     self.kill_horse()
+                    self.wait_for_horse()
                     break
 
             except OSError as e:
@@ -730,8 +771,8 @@ class Worker(object):
             ).format(ret_val))
 
             self.handle_job_failure(
-                job,
-                exc_string="Work-horse process was terminated unexpectedly "
+                job, queue=queue,
+                exc_string="Work-horse was terminated unexpectedly "
                            "(waitpid returned %s)" % ret_val
             )
 
@@ -743,7 +784,7 @@ class Worker(object):
         """
         self.set_state(WorkerStatus.BUSY)
         self.fork_work_horse(job, queue)
-        self.monitor_work_horse(job)
+        self.monitor_work_horse(job, queue)
         self.set_state(WorkerStatus.IDLE)
 
     def main_work_horse(self, job, queue):
@@ -752,14 +793,12 @@ class Worker(object):
         # that are different from the worker.
         random.seed()
 
+        self.setup_work_horse_signals()
+        self._is_horse = True
+        self.log = logger
         try:
-            self.setup_work_horse_signals()
-            self._is_horse = True
-            self.log = logger
             self.perform_job(job, queue)
-        except Exception as e:  # noqa
-            # Horse does not terminate properly
-            raise e
+        except:
             os._exit(1)
 
         # os._exit() is the way to exit from childs after a fork(), in
@@ -786,7 +825,7 @@ class Worker(object):
             timeout = job.timeout or 180
 
         if heartbeat_ttl is None:
-            heartbeat_ttl = self.job_monitoring_interval + 5
+            heartbeat_ttl = self.job_monitoring_interval + 60
 
         with self.connection.pipeline() as pipeline:
             self.set_state(WorkerStatus.BUSY, pipeline=pipeline)
@@ -802,7 +841,7 @@ class Worker(object):
         msg = 'Processing {0} from {1} since {2}'
         self.procline(msg.format(job.func_name, job.origin, time.time()))
 
-    def handle_job_failure(self, job, started_job_registry=None,
+    def handle_job_failure(self, job, queue, started_job_registry=None,
                            exc_string=''):
         """Handles the failure or an executing job by:
             1. Setting the job status to failed
@@ -818,10 +857,19 @@ class Worker(object):
                     self.connection,
                     job_class=self.job_class
                 )
-            job.set_status(JobStatus.FAILED, pipeline=pipeline)
+
+            # Requeue/reschedule if retry is configured
+            if job.retries_left and job.retries_left > 0:
+                retry = True
+                retry_interval = job.get_retry_interval()
+                job.retries_left = job.retries_left - 1
+            else:
+                retry = False
+                job.set_status(JobStatus.FAILED, pipeline=pipeline)
+
             started_job_registry.remove(job, pipeline=pipeline)
 
-            if not self.disable_default_exception_handler:
+            if not self.disable_default_exception_handler and not retry:
                 failed_job_registry = FailedJobRegistry(job.origin, job.connection,
                                                         job_class=self.job_class)
                 failed_job_registry.add(job, ttl=job.failure_ttl,
@@ -831,9 +879,16 @@ class Worker(object):
             self.increment_failed_job_count(pipeline)
             if job.started_at and job.ended_at:
                 self.increment_total_working_time(
-                    job.ended_at - job.started_at,
-                    pipeline
+                    job.ended_at - job.started_at, pipeline
                 )
+
+            if retry:
+                if retry_interval:
+                    scheduled_datetime = datetime.now(timezone.utc) + timedelta(seconds=retry_interval)
+                    job.set_status(JobStatus.SCHEDULED)
+                    queue.schedule_job(job, scheduled_datetime, pipeline=pipeline)
+                else:
+                    queue.enqueue_job(job, pipeline=pipeline)
 
             try:
                 pipeline.execute()
@@ -881,12 +936,13 @@ class Worker(object):
         """Performs the actual work of a job.  Will/should only be called
         inside the work horse's process.
         """
-        self.prepare_job_execution(job, heartbeat_ttl)
         push_connection(self.connection)
 
         started_job_registry = queue.started_job_registry
 
         try:
+            self.prepare_job_execution(job, heartbeat_ttl)
+
             job.started_at = utcnow()
             timeout = job.timeout or self.queue_class.DEFAULT_TIMEOUT
             with self.death_penalty_class(timeout, JobTimeoutException, job_id=job.id):
@@ -906,7 +962,7 @@ class Worker(object):
             exc_string = self._get_safe_exception_string(
                 traceback.format_exception(*exc_info)
             )
-            self.handle_job_failure(job=job, exc_string=exc_string,
+            self.handle_job_failure(job=job, exc_string=exc_string, queue=queue,
                                     started_job_registry=started_job_registry)
             self.handle_exception(job, *exc_info)
             return False
@@ -933,7 +989,7 @@ class Worker(object):
     def handle_exception(self, job, *exc_info):
         """Walks the exception handler stack to delegate exception handling."""
         exc_string = Worker._get_safe_exception_string(
-            traceback.format_exception_only(*exc_info[:2]) + traceback.format_exception(*exc_info)
+            traceback.format_exception(*exc_info)
         )
         self.log.error(exc_string, exc_info=True, extra={
             'func': job.func_name,
@@ -996,10 +1052,10 @@ class Worker(object):
 
     @property
     def should_run_maintenance_tasks(self):
-        """Maintenance tasks should run on first startup or 15 minutes."""
+        """Maintenance tasks should run on first startup or every 10 minutes."""
         if self.last_cleaned_at is None:
             return True
-        if (utcnow() - self.last_cleaned_at) > timedelta(minutes=15):
+        if (utcnow() - self.last_cleaned_at) > timedelta(minutes=10):
             return True
         return False
 
@@ -1010,7 +1066,11 @@ class SimpleWorker(Worker):
 
     def execute_job(self, job, queue):
         """Execute job in same thread/process, do not fork()"""
-        timeout = (job.timeout or DEFAULT_WORKER_TTL) + 5
+        # "-1" means that jobs never timeout. In this case, we should _not_ do -1 + 60 = 59. We should just stick to DEFAULT_WORKER_TTL.
+        if job.timeout == -1:
+               timeout = DEFAULT_WORKER_TTL
+        else:
+               timeout = (job.timeout or DEFAULT_WORKER_TTL) + 60
         return self.perform_job(job, queue, heartbeat_ttl=timeout)
 
 

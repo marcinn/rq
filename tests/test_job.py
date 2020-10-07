@@ -2,34 +2,26 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
-import sys
+import json
 import time
+import queue
 import zlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from redis import WatchError
 
 from rq.compat import PY2, as_text
-from rq.exceptions import NoSuchJobError, UnpickleError
-from rq.job import Job, JobStatus, cancel_job, get_current_job
+from rq.exceptions import NoSuchJobError
+from rq.job import Job, JobStatus, cancel_job, get_current_job, Retry
 from rq.queue import Queue
 from rq.registry import (DeferredJobRegistry, FailedJobRegistry,
                          FinishedJobRegistry, StartedJobRegistry,
                          ScheduledJobRegistry)
-from rq.utils import utcformat
+from rq.utils import utcformat, utcnow
 from rq.worker import Worker
 from tests import RQTestCase, fixtures
 
-is_py2 = sys.version[0] == '2'
-if is_py2:
-    import Queue as queue
-else:
-    import queue as queue
-
-try:
-    from cPickle import loads, dumps
-except ImportError:
-    from pickle import loads, dumps
+from pickle import loads, dumps
 
 
 class TestJob(RQTestCase):
@@ -113,6 +105,17 @@ class TestJob(RQTestCase):
         job = Job.create(func=n.div, args=(4,))
 
         # Job data is set
+        self.assertEqual(job.func, n.div)
+        self.assertEqual(job.instance, n)
+        self.assertEqual(job.args, (4,))
+
+    def test_create_job_with_serializer(self):
+        """Creation of jobs with serializer for instance methods."""
+        # Test using json serializer
+        n = fixtures.Number(2)
+        job = Job.create(func=n.div, args=(4,), serializer=json)
+
+        self.assertIsNotNone(job.serializer)
         self.assertEqual(job.func, n.div)
         self.assertEqual(job.instance, n)
         self.assertEqual(job.args, (4,))
@@ -219,7 +222,20 @@ class TestJob(RQTestCase):
         # ... and no other keys are stored
         self.assertEqual(
             sorted(self.testconn.hkeys(job.key)),
-            [b'created_at', b'data', b'description'])
+            [b'created_at', b'data', b'description', b'ended_at', b'started_at'])
+    
+    def test_persistence_of_retry_data(self):
+        """Retry related data is stored and restored properly"""
+        job = Job.create(func=fixtures.some_calculation)
+        job.retries_left = 3
+        job.retry_intervals = [1, 2, 3]
+        job.save()
+
+        job.retries_left = None
+        job.retry_intervals = None
+        job.refresh()
+        self.assertEqual(job.retries_left, 3)
+        self.assertEqual(job.retry_intervals, [1, 2, 3])
 
     def test_persistence_of_parent_job(self):
         """Storing jobs with parent job, either instance or key."""
@@ -273,7 +289,7 @@ class TestJob(RQTestCase):
         job.refresh()
 
         for attr in ('func_name', 'instance', 'args', 'kwargs'):
-            with self.assertRaises(UnpickleError):
+            with self.assertRaises(Exception):
                 getattr(job, attr)
 
     def test_job_is_unimportable(self):
@@ -371,13 +387,14 @@ class TestJob(RQTestCase):
         job = Job.create(func=fixtures.say_hello, args=('Lionel',))
         job._result = queue.Queue()
         job.save()
+
         self.assertEqual(
             self.testconn.hget(job.key, 'result').decode('utf-8'),
-            'Unpickleable return value'
+            'Unserializable return value'
         )
 
         job = Job.fetch(job.id)
-        self.assertEqual(job.result, 'Unpickleable return value')
+        self.assertEqual(job.result, 'Unserializable return value')
 
     def test_result_ttl_is_persisted(self):
         """Ensure that job's result_ttl is set properly"""
@@ -523,6 +540,16 @@ class TestJob(RQTestCase):
 
         self.assertEqual(self.testconn.ttl(dependent_job.dependencies_key), 100)
         self.assertEqual(self.testconn.ttl(dependency_job.dependents_key), 100)
+
+    def test_job_get_position(self):
+        queue = Queue(connection=self.testconn)
+        job = queue.enqueue(fixtures.say_hello)
+        job2 = queue.enqueue(fixtures.say_hello)
+        job3 = Job(fixtures.say_hello)
+
+        self.assertEqual(0, job.get_position())
+        self.assertEqual(1, job2.get_position())
+        self.assertEqual(None, job3.get_position())
 
     def test_job_with_dependents_delete_parent(self):
         """job.delete() deletes itself from Redis but not dependents.
@@ -769,8 +796,12 @@ class TestJob(RQTestCase):
 
         dependency_job.delete()
 
-        with self.assertRaises(NoSuchJobError):
-            dependent_job.fetch_dependencies(pipeline=self.testconn)
+        self.assertNotIn(
+            dependent_job.id,
+            [job.id for job in dependent_job.fetch_dependencies(
+                pipeline=self.testconn
+            )]
+        )
 
     def test_fetch_dependencies_watches(self):
         queue = Queue(connection=self.testconn)
@@ -792,3 +823,160 @@ class TestJob(RQTestCase):
                 self.testconn.set(dependency_job.id, 'somethingelsehappened')
                 pipeline.touch(dependency_job.id)
                 pipeline.execute()
+
+    def test_dependencies_finished_returns_false_if_dependencies_queued(self):
+        queue = Queue(connection=self.testconn)
+
+        dependency_job_ids = [
+            queue.enqueue(fixtures.say_hello).id
+            for _ in range(5)
+        ]
+
+        dependent_job = Job.create(func=fixtures.say_hello)
+        dependent_job._dependency_ids = dependency_job_ids
+        dependent_job.register_dependency()
+
+        dependencies_finished = dependent_job.dependencies_are_met()
+
+        self.assertFalse(dependencies_finished)
+
+    def test_dependencies_finished_returns_true_if_no_dependencies(self):
+        queue = Queue(connection=self.testconn)
+
+        dependent_job = Job.create(func=fixtures.say_hello)
+        dependent_job.register_dependency()
+
+        dependencies_finished = dependent_job.dependencies_are_met()
+
+        self.assertTrue(dependencies_finished)
+
+    def test_dependencies_finished_returns_true_if_all_dependencies_finished(self):
+        dependency_jobs = [
+            Job.create(fixtures.say_hello)
+            for _ in range(5)
+        ]
+
+        dependent_job = Job.create(func=fixtures.say_hello)
+        dependent_job._dependency_ids = [job.id for job in dependency_jobs]
+        dependent_job.register_dependency()
+
+        now = utcnow()
+
+        # Set ended_at timestamps
+        for i, job in enumerate(dependency_jobs):
+            job._status = JobStatus.FINISHED
+            job.ended_at = now - timedelta(seconds=i)
+            job.save()
+
+        dependencies_finished = dependent_job.dependencies_are_met()
+
+        self.assertTrue(dependencies_finished)
+
+    def test_dependencies_finished_returns_false_if_unfinished_job(self):
+        dependency_jobs = [Job.create(fixtures.say_hello) for _ in range(2)]
+
+        dependency_jobs[0]._status = JobStatus.FINISHED
+        dependency_jobs[0].ended_at = utcnow()
+        dependency_jobs[0].save()
+
+        dependency_jobs[1]._status = JobStatus.STARTED
+        dependency_jobs[1].ended_at = None
+        dependency_jobs[1].save()
+
+        dependent_job = Job.create(func=fixtures.say_hello)
+        dependent_job._dependency_ids = [job.id for job in dependency_jobs]
+        dependent_job.register_dependency()
+
+        now = utcnow()
+
+        dependencies_finished = dependent_job.dependencies_are_met()
+
+        self.assertFalse(dependencies_finished)
+
+    def test_dependencies_finished_watches_job(self):
+        queue = Queue(connection=self.testconn)
+
+        dependency_job = queue.enqueue(fixtures.say_hello)
+
+        dependent_job = Job.create(func=fixtures.say_hello)
+        dependent_job._dependency_ids = [dependency_job.id]
+        dependent_job.register_dependency()
+
+        with self.testconn.pipeline() as pipeline:
+            dependent_job.dependencies_are_met(
+                pipeline=pipeline,
+            )
+
+            dependency_job.set_status(JobStatus.FAILED, pipeline=self.testconn)
+            pipeline.multi()
+
+            with self.assertRaises(WatchError):
+                pipeline.touch(Job.key_for(dependent_job.id))
+                pipeline.execute()
+
+    def test_can_enqueue_job_if_dependency_is_deleted(self):
+        queue = Queue(connection=self.testconn)
+
+        dependency_job = queue.enqueue(fixtures.say_hello, result_ttl=0)
+
+        w = Worker([queue])
+        w.work(burst=True)
+
+        assert queue.enqueue(fixtures.say_hello, depends_on=dependency_job)
+
+    def test_dependents_are_met_if_dependency_is_deleted(self):
+        queue = Queue(connection=self.testconn)
+
+        dependency_job = queue.enqueue(fixtures.say_hello, result_ttl=0)
+        dependent_job = queue.enqueue(fixtures.say_hello, depends_on=dependency_job)
+
+        w = Worker([queue])
+        w.work(burst=True, max_jobs=1)
+
+        assert dependent_job.dependencies_are_met()
+        assert dependent_job.get_status() == JobStatus.QUEUED
+    
+    def test_retry(self):
+        """Retry parses `max` and `interval` correctly"""
+        retry = Retry(max=1)
+        self.assertEqual(retry.max, 1)
+        self.assertEqual(retry.intervals, [0])
+        self.assertRaises(ValueError, Retry, max=0)
+
+        retry = Retry(max=2, interval=5)
+        self.assertEqual(retry.max, 2)
+        self.assertEqual(retry.intervals, [5])
+
+        retry = Retry(max=3, interval=[5, 10])
+        self.assertEqual(retry.max, 3)
+        self.assertEqual(retry.intervals, [5, 10])
+
+        # interval can't be negative
+        self.assertRaises(ValueError, Retry, max=1, interval=-5)
+        self.assertRaises(ValueError, Retry, max=1, interval=[1, -5])
+    
+    def test_get_retry_interval(self):
+        """get_retry_interval() returns the right retry interval"""
+        job = Job.create(func=fixtures.say_hello)
+
+        # Handle case where self.retry_intervals is None
+        job.retries_left = 2
+        self.assertEqual(job.get_retry_interval(), 0)
+
+        # Handle the most common case
+        job.retry_intervals = [1, 2]
+        self.assertEqual(job.get_retry_interval(), 1)
+        job.retries_left = 1
+        self.assertEqual(job.get_retry_interval(), 2)
+        
+        # Handle cases where number of retries > length of interval
+        job.retries_left = 4
+        job.retry_intervals = [1, 2, 3]
+        self.assertEqual(job.get_retry_interval(), 1)
+        job.retries_left = 3
+        self.assertEqual(job.get_retry_interval(), 1)
+        job.retries_left = 2
+        self.assertEqual(job.get_retry_interval(), 2)
+        job.retries_left = 1
+        self.assertEqual(job.get_retry_interval(), 3)
+        

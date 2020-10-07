@@ -37,7 +37,10 @@ class BaseRegistry(object):
         return self.count
 
     def __eq__(self, other):
-        return (self.name == other.name and self.connection == other.connection)
+        return (
+            self.name == other.name and
+            self.connection.connection_pool.connection_kwargs == other.connection.connection_pool.connection_kwargs
+        )
 
     def __contains__(self, item):
         """
@@ -135,6 +138,7 @@ class StartedJobRegistry(BaseRegistry):
                         job = self.job_class.fetch(job_id,
                                                    connection=self.connection)
                         job.set_status(JobStatus.FAILED)
+                        job.exc_info = "Moved to FailedJobRegistry at %s" % datetime.now()
                         job.save(pipeline=pipeline, include_meta=False)
                         job.cleanup(ttl=-1, pipeline=pipeline)
                         failed_job_registry.add(job, job.failure_ttl)
@@ -214,10 +218,15 @@ class FailedJobRegistry(BaseRegistry):
         if not result:
             raise InvalidJobOperation
 
-        queue = Queue(job.origin, connection=self.connection,
-                      job_class=self.job_class)
-
-        return queue.enqueue_job(job)
+        with self.connection.pipeline() as pipeline:
+            queue = Queue(job.origin, connection=self.connection,
+                          job_class=self.job_class)
+            job.started_at = None
+            job.ended_at = None
+            job.save()
+            job = queue.enqueue_job(job, pipeline=pipeline)
+            pipeline.execute()
+        return job
 
 
 class DeferredJobRegistry(BaseRegistry):
@@ -259,7 +268,7 @@ class ScheduledJobRegistry(BaseRegistry):
                 from datetime import timezone
             except ImportError:
                 raise ValueError('datetime object with no timezone')
-            tz = timezone(timedelta(seconds=-time.timezone))
+            tz = timezone(timedelta(seconds=-(time.timezone if time.daylight == 0 else time.altzone)))
             scheduled_datetime = scheduled_datetime.replace(tzinfo=tz)
 
         timestamp = calendar.timegm(scheduled_datetime.utctimetuple())
@@ -298,7 +307,7 @@ class ScheduledJobRegistry(BaseRegistry):
 
 
 def clean_registries(queue):
-    """Cleans StartedJobRegistry and FinishedJobRegistry of a queue."""
+    """Cleans StartedJobRegistry, FinishedJobRegistry and FailedJobRegistry of a queue."""
     registry = FinishedJobRegistry(name=queue.name,
                                    connection=queue.connection,
                                    job_class=queue.job_class)

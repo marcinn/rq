@@ -2,6 +2,7 @@
 from __future__ import (absolute_import, division, print_function,
                         unicode_literals)
 
+import json
 import os
 import shutil
 import signal
@@ -10,7 +11,7 @@ import sys
 import time
 import zlib
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from multiprocessing import Process
 from time import sleep
 
@@ -24,12 +25,12 @@ from tests import RQTestCase, slow
 from tests.fixtures import (
     access_self, create_file, create_file_after_timeout, div_by_zero, do_nothing,
     kill_worker, long_running_job, modify_self, modify_self_and_error,
-    run_dummy_heroku_worker, save_key_ttl, say_hello, say_pid,
+    run_dummy_heroku_worker, save_key_ttl, say_hello, say_pid, raise_exc_mock
 )
 
 from rq import Queue, SimpleWorker, Worker, get_current_connection
 from rq.compat import as_text, PY2
-from rq.job import Job, JobStatus
+from rq.job import Job, JobStatus, Retry
 from rq.registry import StartedJobRegistry, FailedJobRegistry, FinishedJobRegistry
 from rq.suspension import resume, suspend
 from rq.utils import utcnow
@@ -96,6 +97,14 @@ class TestWorker(RQTestCase):
         w = Worker([Queue('foo'), Queue('bar')])
         self.assertEqual(w.queues[0].name, 'foo')
         self.assertEqual(w.queues[1].name, 'bar')
+
+        # With string and serializer
+        w = Worker('foo', serializer=json)
+        self.assertEqual(w.queues[0].name, 'foo')
+
+        # With queue having serializer
+        w = Worker(Queue('foo'), serializer=json)
+        self.assertEqual(w.queues[0].name, 'foo')
 
     def test_work_and_quit(self):
         """Worker processes work, then quits."""
@@ -303,6 +312,37 @@ class TestWorker(RQTestCase):
         self.assertEqual(str(job.enqueued_at), enqueued_at_date)
         self.assertTrue(job.exc_info)  # should contain exc_info
 
+    def test_horse_fails(self):
+        """Tests that job status is set to FAILED even if horse unexpectedly fails"""
+        q = Queue()
+        self.assertEqual(q.count, 0)
+
+        # Action
+        job = q.enqueue(say_hello)
+        self.assertEqual(q.count, 1)
+
+        # keep for later
+        enqueued_at_date = str(job.enqueued_at)
+
+        w = Worker([q])
+        with mock.patch.object(w, 'perform_job', new_callable=raise_exc_mock):
+            w.work(burst=True)  # should silently pass
+
+        # Postconditions
+        self.assertEqual(q.count, 0)
+        failed_job_registry = FailedJobRegistry(queue=q)
+        self.assertTrue(job in failed_job_registry)
+        self.assertEqual(w.get_current_job_id(), None)
+
+        # Check the job
+        job = Job.fetch(job.id)
+        self.assertEqual(job.origin, q.name)
+
+        # Should be the original enqueued_at date, not the date of enqueueing
+        # to the failed queue
+        self.assertEqual(str(job.enqueued_at), enqueued_at_date)
+        self.assertTrue(job.exc_info)  # should contain exc_info
+
     def test_statistics(self):
         """Successful and failed job counts are saved properly"""
         queue = Queue()
@@ -317,7 +357,7 @@ class TestWorker(RQTestCase):
         registry = StartedJobRegistry(connection=worker.connection)
         job.started_at = utcnow()
         job.ended_at = job.started_at + timedelta(seconds=0.75)
-        worker.handle_job_failure(job)
+        worker.handle_job_failure(job, queue)
         worker.handle_job_success(job, queue, registry)
 
         worker.refresh()
@@ -325,13 +365,72 @@ class TestWorker(RQTestCase):
         self.assertEqual(worker.successful_job_count, 1)
         self.assertEqual(worker.total_working_time, 1.5)  # 1.5 seconds
 
-        worker.handle_job_failure(job)
+        worker.handle_job_failure(job, queue)
         worker.handle_job_success(job, queue, registry)
 
         worker.refresh()
         self.assertEqual(worker.failed_job_count, 2)
         self.assertEqual(worker.successful_job_count, 2)
         self.assertEqual(worker.total_working_time, 3.0)
+    
+    def test_handle_retry(self):
+        """handle_job_failure() handles retry properly"""
+        connection = self.testconn
+        queue = Queue(connection=connection)
+        retry = Retry(max=2)
+        job = queue.enqueue(div_by_zero, retry=retry)
+        registry = FailedJobRegistry(queue=queue)
+
+        worker = Worker([queue])
+
+        # If job if configured to retry, it will be put back in the queue
+        # and not put in the FailedJobRegistry.
+        # This is the original execution
+        queue.empty()
+        worker.handle_job_failure(job, queue)
+        job.refresh()
+        self.assertEqual(job.retries_left, 1)
+        self.assertEqual([job.id], queue.job_ids)
+        self.assertFalse(job in registry)
+
+        # First retry
+        queue.empty()
+        worker.handle_job_failure(job, queue)
+        job.refresh()
+        self.assertEqual(job.retries_left, 0)
+        self.assertEqual([job.id], queue.job_ids)
+
+        # Second retry
+        queue.empty()
+        worker.handle_job_failure(job, queue)
+        job.refresh()
+        self.assertEqual(job.retries_left, 0)
+        self.assertEqual([], queue.job_ids)
+        # If a job is no longer retries, it's put in FailedJobRegistry
+        self.assertTrue(job in registry)
+    
+    def test_retry_interval(self):
+        """Retries with intervals are scheduled"""
+        connection = self.testconn
+        queue = Queue(connection=connection)
+        retry = Retry(max=1, interval=5)
+        job = queue.enqueue(div_by_zero, retry=retry)
+
+        worker = Worker([queue])
+        registry = queue.scheduled_job_registry
+        # If job if configured to retry with interval, it will be scheduled,
+        # not directly put back in the queue
+        queue.empty()
+        worker.handle_job_failure(job, queue)
+        job.refresh()
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+        self.assertEqual(job.retries_left, 0)
+        self.assertEqual(len(registry), 1)
+        self.assertEqual(queue.job_ids, [])
+        # Scheduled time is roughly 5 seconds from now
+        scheduled_time = registry.get_scheduled_time(job)
+        now = datetime.now(timezone.utc)
+        self.assertTrue(now + timedelta(seconds=4) < scheduled_time < now + timedelta(seconds=6))
 
     def test_total_working_time(self):
         """worker.total_working_time is stored properly"""
@@ -1047,7 +1146,7 @@ class WorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
         w.fork_work_horse(job, queue)
         p = Process(target=wait_and_kill_work_horse, args=(w._horse_pid, 0.5))
         p.start()
-        w.monitor_work_horse(job)
+        w.monitor_work_horse(job, queue)
         job_status = job.get_status()
         p.join(1)
         self.assertEqual(job_status, JobStatus.FAILED)
@@ -1073,9 +1172,9 @@ class WorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
         job.timeout = 5
         w.job_monitoring_interval = 1
         now = utcnow()
-        w.monitor_work_horse(job)
+        w.monitor_work_horse(job, queue)
         fudge_factor = 1
-        total_time = w.job_monitoring_interval + 5 + fudge_factor
+        total_time = w.job_monitoring_interval + 65 + fudge_factor
         self.assertTrue((utcnow() - now).total_seconds() < total_time)
         self.assertEqual(job.get_status(), JobStatus.FAILED)
         failed_job_registry = FailedJobRegistry(queue=fooq)
@@ -1143,10 +1242,6 @@ class HerokuWorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
         self.assertEqual(p.exitcode, 1)
         self.assertTrue(os.path.exists(os.path.join(self.sandbox, 'started')))
         self.assertFalse(os.path.exists(os.path.join(self.sandbox, 'finished')))
-        with open(os.path.join(self.sandbox, 'stderr.log')) as f:
-            stderr = f.read().strip('\n')
-            err = 'ShutDownImminentException: shut down imminent (signal: SIGRTMIN)'
-            self.assertTrue(stderr.endswith(err), stderr)
 
     @slow
     def test_1_sec_shutdown(self):
@@ -1163,10 +1258,6 @@ class HerokuWorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
 
         self.assertTrue(os.path.exists(os.path.join(self.sandbox, 'started')))
         self.assertFalse(os.path.exists(os.path.join(self.sandbox, 'finished')))
-        with open(os.path.join(self.sandbox, 'stderr.log')) as f:
-            stderr = f.read().strip('\n')
-            err = 'ShutDownImminentException: shut down imminent (signal: SIGALRM)'
-            self.assertTrue(stderr.endswith(err), stderr)
 
     @slow
     def test_shutdown_double_sigrtmin(self):
@@ -1184,12 +1275,9 @@ class HerokuWorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
 
         self.assertTrue(os.path.exists(os.path.join(self.sandbox, 'started')))
         self.assertFalse(os.path.exists(os.path.join(self.sandbox, 'finished')))
-        with open(os.path.join(self.sandbox, 'stderr.log')) as f:
-            stderr = f.read().strip('\n')
-            err = 'ShutDownImminentException: shut down imminent (signal: SIGRTMIN)'
-            self.assertTrue(stderr.endswith(err), stderr)
 
-    def test_handle_shutdown_request(self):
+    @mock.patch('rq.worker.logger.info')
+    def test_handle_shutdown_request(self, mock_logger_info):
         """Mutate HerokuWorker so _horse_pid refers to an artificial process
         and test handle_warm_shutdown_request"""
         w = HerokuWorker('foo')
@@ -1202,8 +1290,10 @@ class HerokuWorkerShutdownTestCase(TimeoutTestCase, RQTestCase):
         w._horse_pid = p.pid
         w.handle_warm_shutdown_request()
         p.join(2)
+        # would expect p.exitcode to be -34
         self.assertEqual(p.exitcode, -34)
         self.assertFalse(os.path.exists(path))
+        mock_logger_info.assert_called_with('Killed horse pid %s', p.pid)
 
     def test_handle_shutdown_request_no_horse(self):
         """Mutate HerokuWorker so _horse_pid refers to non existent process

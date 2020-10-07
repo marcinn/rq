@@ -20,7 +20,7 @@ RQ to have job scheduling capabilities without:
 2. Worrying about a separate `Scheduler` class.
 
 
-# Scheduling Jobs for Execution
+## Scheduling Jobs for Execution
 
 There are two main APIs to schedule jobs for execution, `enqueue_at()` and `enqueue_in()`.
 
@@ -53,7 +53,7 @@ from somewhere import say_hello
 queue = Queue(name='default', connection=Redis())
 
 # Schedules job to be run in 10 seconds
-job = queue.enqueue_at(timedelta(seconds=10), say_hello)
+job = queue.enqueue_in(timedelta(seconds=10), say_hello)
 ```
 
 Jobs that are scheduled for execution are not placed in the queue, but they are
@@ -76,7 +76,7 @@ registry = ScheduledJobRegistry(queue=queue)
 print(job in registry)  # Outputs True as job is placed in ScheduledJobRegistry
 ```
 
-# Running the Scheduler
+## Running the Scheduler
 
 If you use RQ's scheduling features, you need to run RQ workers with the
 scheduler component enabled.

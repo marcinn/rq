@@ -1,3 +1,53 @@
+### RQ 1.5.2 (2020-09-10)
+* Scheduler now uses the class of connection that's used. Thanks @pacahon!
+* Fixes a bug that puts retried jobs in `FailedJobRegistry`. Thanks @selwin!
+* Fixed a deprecated import. Thanks @elmaghallawy!
+
+### RQ 1.5.1 (2020-08-21)
+* Fixes for Redis server version parsing. Thanks @selwin!
+* Retries can now be set through @job decorator. Thanks @nerok!
+* Log messages below logging.ERROR is now sent to stdout. Thanks @selwin!
+* Better logger name for RQScheduler. Thanks @atainter!
+* Better handling of exceptions thrown by horses. Thanks @theambient! 
+
+### RQ 1.5.0 (2020-07-26)
+* Failed jobs can now be retried. Thanks @selwin!
+* Fixed scheduler on Python > 3.8.0. Thanks @selwin!
+* RQ is now aware of which version of Redis server it's running on. Thanks @aparcar!
+* RQ now uses `hset()` on redis-py >= 3.5.0. Thanks @aparcar!
+* Fix incorrect worker timeout calculation in SimpleWorker.execute_job(). Thanks @davidmurray!
+* Make horse handling logic more robust. Thanks @wevsty!
+
+### RQ 1.4.3 (2020-06-28)
+* Added `job.get_position()` and `queue.get_job_position()`. Thanks @aparcar!
+* Longer TTLs for worker keys to prevent them from expiring inside the worker lifecycle. Thanks @selwin!
+* Long job args/kwargs are now truncated during logging. Thanks @JhonnyBn!
+* `job.requeue()` now returns the modified job. Thanks @ericatkin!
+
+### RQ 1.4.2 (2020-05-26)
+* Reverted changes to `hmset` command which causes workers on Redis server < 4 to crash. Thanks @selwin!
+* Merged in more groundwork to enable jobs with multiple dependencies. Thanks @thomasmatecki!
+
+### RQ 1.4.1 (2020-05-16)
+* Default serializer now uses `pickle.HIGHEST_PROTOCOL` for backward compatibility reasons. Thanks @bbayles!
+* Avoid deprecation warnings on redis-py >= 3.5.0. Thanks @bbayles!
+
+### RQ 1.4.0 (2020-05-13)
+* Custom serializer is now supported. Thanks @solababs!
+* `delay()` now accepts `job_id` argument. Thanks @grayshirt!
+* Fixed a bug that may cause early termination of scheduled or requeued jobs. Thanks @rmartin48!
+* When a job is scheduled, always add queue name to a set containing active RQ queue names. Thanks @mdawar!
+* Added `--sentry-ca-certs` and `--sentry-debug` parameters to `rq worker` CLI. Thanks @kichawa!
+* Jobs cleaned up by `StartedJobRegistry` are given an exception info. Thanks @selwin!
+* Python 2.7 is no longer supported. Thanks @selwin!
+
+### RQ 1.3.0 (2020-03-09)
+* Support for infinite job timeout. Thanks @theY4Kman!
+* Added `__main__` file so you can now do `python -m rq.cli`. Thanks @bbayles!
+* Fixes an issue that may cause zombie processes. Thanks @wevsty!
+* `job_id` is now passed to logger during failed jobs. Thanks @smaccona!
+* `queue.enqueue_at()` and `queue.enqueue_in()` now supports explicit `args` and `kwargs` function invocation. Thanks @selwin!
+
 ### RQ 1.2.2 (2020-01-31)
 * `Job.fetch()` now properly handles unpickleable return values. Thanks @selwin!
 

@@ -54,6 +54,7 @@ def get_redis_from_config(settings, connection_class=Redis):
         'db': settings.get('REDIS_DB', 0),
         'password': settings.get('REDIS_PASSWORD', None),
         'ssl': settings.get('REDIS_SSL', False),
+        'ssl_ca_certs': settings.get('REDIS_SSL_CA_CERTS', None),
     }
 
     return connection_class(**kwargs)
@@ -143,7 +144,7 @@ def show_workers(queues, raw, by_queue, queue_class, worker_class):
             queue_dict[queue] = worker_class.all(queue=queue)
 
         if queue_dict:
-            max_length = max([len(q.name) for q, in queue_dict.keys()])
+            max_length = max(len(q.name) for q, in queue_dict.keys())
         else:
             max_length = 0
 

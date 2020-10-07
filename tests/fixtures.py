@@ -37,6 +37,11 @@ def do_nothing():
     """The best job in the world."""
     pass
 
+def raise_exc():
+    raise Exception('raise_exc error')
+
+def raise_exc_mock():
+    return raise_exc
 
 def div_by_zero(x):
     """Prepare for a division-by-zero exception."""
@@ -175,3 +180,10 @@ def kill_worker(pid, double_kill, interval=0.5):
         # give the worker time to switch signal handler
         time.sleep(interval)
         os.kill(pid, signal.SIGTERM)
+
+
+class Serializer(object):
+    def loads(self): pass
+
+    def dumps(self): pass
+

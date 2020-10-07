@@ -7,7 +7,7 @@ from multiprocessing import Process
 from rq import Queue
 from rq.compat import utc, PY2
 from rq.exceptions import NoSuchJobError
-from rq.job import Job
+from rq.job import Job, Retry
 from rq.registry import FinishedJobRegistry, ScheduledJobRegistry
 from rq.scheduler import RQScheduler
 from rq.utils import current_timestamp
@@ -70,9 +70,38 @@ class TestScheduledJobRegistry(RQTestCase):
             # If we pass in a datetime with no timezone, `schedule()`
             # assumes local timezone so depending on your local timezone,
             # the timestamp maybe different
-            registry.schedule(job, datetime(2019, 1, 1))
-            self.assertEqual(self.testconn.zscore(registry.key, job.id),
-                             1546300800 + time.timezone)  # 2019-01-01 UTC in Unix timestamp
+
+            # we need to account for the difference between a timezone
+            # with DST active and without DST active.  The time.timezone
+            # property isn't accurate when time.daylight is non-zero,
+            # we'll test both.
+
+            # first, time.daylight == 0 (not in DST).
+            # mock the sitatuoin for American/New_York not in DST (UTC - 5)
+            # time.timezone = 18000
+            # time.daylight = 0
+            # time.altzone = 14400
+            mock_day = mock.patch('time.daylight', 0)
+            mock_tz = mock.patch('time.timezone', 18000)
+            mock_atz = mock.patch('time.altzone', 14400)
+            with mock_tz, mock_day, mock_atz:
+                registry.schedule(job, datetime(2019, 1, 1))
+                self.assertEqual(self.testconn.zscore(registry.key, job.id),
+                                1546300800 + 18000)  # 2019-01-01 UTC in Unix timestamp
+
+            # second, time.daylight != 0 (in DST)
+            # mock the sitatuoin for American/New_York not in DST (UTC - 4)
+            # time.timezone = 18000
+            # time.daylight = 1
+            # time.altzone = 14400
+            mock_day = mock.patch('time.daylight', 1)
+            mock_tz = mock.patch('time.timezone', 18000)
+            mock_atz = mock.patch('time.altzone', 14400)
+            with mock_tz, mock_day, mock_atz:
+                registry.schedule(job, datetime(2019, 1, 1))
+                self.assertEqual(self.testconn.zscore(registry.key, job.id),
+                                1546300800 + 14400)  # 2019-01-01 UTC in Unix timestamp
+
 
             # Score is always stored in UTC even if datetime is in a different tz
             tz = timezone(timedelta(hours=7))
@@ -99,8 +128,8 @@ class TestScheduler(RQTestCase):
         self.assertTrue(scheduler.should_reacquire_locks)
         scheduler.acquire_locks()
         self.assertIsNotNone(scheduler.lock_acquisition_time)
-        
-        # scheduler.should_reacquire_locks always returns False if 
+
+        # scheduler.should_reacquire_locks always returns False if
         # scheduler.acquired_locks and scheduler._queue_names are the same
         self.assertFalse(scheduler.should_reacquire_locks)
         scheduler.lock_acquisition_time = datetime.now() - timedelta(minutes=16)
@@ -251,7 +280,7 @@ class TestWorker(RQTestCase):
 
         p.start()
         queue.enqueue_at(datetime(2019, 1, 1, tzinfo=utc), say_hello)
-        worker.work(burst=False, with_scheduler=True)        
+        worker.work(burst=False, with_scheduler=True)
         p.join(1)
         self.assertIsNotNone(worker.scheduler)
         registry = FinishedJobRegistry(queue=queue)
@@ -292,3 +321,12 @@ class TestQueue(RQTestCase):
         self.assertTrue(
             now + timedelta(seconds=28) < scheduled_time < now + timedelta(seconds=32)
         )
+
+    def test_enqueue_in_with_retry(self):
+        """ Ensure that the retry parameter is passed
+        to the enqueue_at function from enqueue_in.
+        """
+        queue = Queue(connection=self.testconn)
+        job = queue.enqueue_in(timedelta(seconds=30), say_hello, retry=Retry(3, [2]))
+        self.assertEqual(job.retries_left, 3)
+        self.assertEqual(job.retry_intervals, [2])
